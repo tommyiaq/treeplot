@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { haversineDistance } from '../utils/gps.js'
+import { loadPlot } from '../utils/loadPlot.js'
 
 const LS_KEY = 'treeplot_v2'
 
@@ -15,8 +16,10 @@ export const usePlotStore = defineStore('plot', {
     llmStatus: 'idle',      // 'idle' | 'loading' | 'ready' | 'error'
     llmProgress: 0,
     llmProgressMsg: '',
-    gpsWaiting: false,      // true while waiting for first fix to seed demo trees
-    measureModalOpen: false, // explicit flag; modal no longer auto-opens on tree tap
+    gpsWaiting: false,
+    measureModalOpen: false,
+    availablePlots: [],     // [{ id, count }] from listPlots()
+    currentAdsId: '1',
   }),
 
   getters: {
@@ -34,8 +37,6 @@ export const usePlotStore = defineStore('plot', {
     },
 
     tappableTrees: (state) => {
-      // All trees are tappable (measured ones can be re-measured to update values)
-      // No GPS → all trees tappable (demo mode)
       if (!state.userPosition) return state.trees
       return state.trees.filter((t) => {
         const d = haversineDistance(state.userPosition, { lat: t.lat, lon: t.lon })
@@ -62,6 +63,20 @@ export const usePlotStore = defineStore('plot', {
       if (center) this.plotCenter = center
       if (name) this.plotName = name
       this.saveToLocalStorage()
+    },
+
+    async changePlot(adsId) {
+      this.currentAdsId = String(adsId)
+      this.selectedTree = null
+      this.chatMessages = []
+      this.gpsWaiting = true
+      try {
+        const trees = await loadPlot(this.currentAdsId)
+        const name = `ADS_${this.currentAdsId}`
+        this.loadTrees(trees, { lat: 43.46878, lon: 11.15117, name }, name)
+      } finally {
+        this.gpsWaiting = false
+      }
     },
 
     /**

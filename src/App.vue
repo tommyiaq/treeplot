@@ -19,10 +19,10 @@
 </template>
 
 <script setup>
-import { ref, onMounted, watch } from 'vue'
+import { ref, onMounted } from 'vue'
 import { usePlotStore } from './store/plot.js'
 
-import { generateMockTrees } from './utils/mockTrees.js'
+import { loadPlot, listPlots } from './utils/loadPlot.js'
 import TopBar from './components/TopBar.vue'
 import TreeMap from './components/TreeMap.vue'
 import ChatPanel from './components/ChatPanel.vue'
@@ -34,40 +34,26 @@ const csvInputRef = ref(null)
 // ──────────────────────────────────────────────
 // Startup: restore from localStorage or wait for GPS
 // ──────────────────────────────────────────────
-let demoSeeded = false
-let gpsTimeoutId = null
+const PLOT_CENTER = { lat: 43.46878, lon: 11.15117 }
 
-function seedDemoTrees(lat, lon) {
-  if (demoSeeded) return
-  demoSeeded = true
-  if (gpsTimeoutId) clearTimeout(gpsTimeoutId)
-  const mockTrees = generateMockTrees(lat, lon)
-  store.loadTrees(mockTrees, { lat, lon, name: 'BOSCO_DEMO' }, 'BOSCO_DEMO')
-  store.gpsWaiting = false
-}
+onMounted(async () => {
+  // Load plot list (needed for dropdown regardless of saved state)
+  listPlots().then(plots => { store.availablePlots = plots }).catch(() => {})
 
-onMounted(() => {
   const restored = store.loadFromLocalStorage()
-  if (restored && store.trees.length > 0) return // saved data found, nothing to do
+  if (restored && store.trees.length > 0) return // saved data found
 
-  // No saved data → wait for first GPS fix to place demo trees
   store.gpsWaiting = true
-
-  // Fallback: if GPS never arrives after 10s, seed at a neutral center
-  gpsTimeoutId = setTimeout(() => {
-    if (!demoSeeded) seedDemoTrees(44.0, 11.0)
-  }, 10000)
-})
-
-// When the first GPS fix arrives and we still need to seed demo trees
-watch(
-  () => store.userPosition,
-  (pos) => {
-    if (pos && !demoSeeded && store.trees.length === 0) {
-      seedDemoTrees(pos.lat, pos.lon)
-    }
+  try {
+    const trees = await loadPlot('1')
+    store.loadTrees(trees, { ...PLOT_CENTER, name: 'ADS_1' }, 'ADS_1')
+  } catch (err) {
+    console.error('[App] Failed to load plot:', err)
+    store.addChatMessage('assistant', '⚠ Impossibile caricare il rilievo. Ricarica la pagina.')
+  } finally {
+    store.gpsWaiting = false
   }
-)
+})
 
 // ──────────────────────────────────────────────
 // CSV handling

@@ -3,6 +3,8 @@
     <canvas
       ref="mapCanvas"
       style="width: 100%; height: 100%; display: block; touch-action: none"
+      @mousemove="onCanvasMouseMove"
+      @mouseleave="onCanvasMouseLeave"
     />
 
     <!-- HUD overlay -->
@@ -31,6 +33,19 @@
       <!-- Temporary HUD message -->
       <div class="hud-message" v-if="hudMessage" :class="{ visible: !!hudMessage }">
         {{ hudMessage }}
+      </div>
+
+      <!-- Hover tooltip -->
+      <div
+        v-if="hoveredTree"
+        class="tree-tooltip"
+        :style="{ left: tooltipX + 'px', top: tooltipY + 'px' }"
+      >
+        <span class="tt-id">{{ hoveredTree.id }}</span>
+        <span class="tt-sp">{{ hoveredTree.specie_raw || hoveredTree.species }}</span>
+        <span class="tt-val">H={{ hoveredTree.height_m != null ? hoveredTree.height_m + 'm' : '—' }} · DBH={{ hoveredTree.diameter_cm != null ? hoveredTree.diameter_cm + 'cm' : '—' }}</span>
+        <span v-if="hoveredDist !== null" class="tt-dist">📍 {{ hoveredDist }}m</span>
+        <span v-if="hoveredTree.measured_at" class="tt-done">✓ misurato</span>
       </div>
     </div>
   </div>
@@ -70,6 +85,16 @@ let gpsWatchId = null
 const nearbyCount = computed(() => store.nearbyTrees.length)
 const hudMessage = ref('')
 let hudMessageTimer = null
+
+// Hover tooltip
+const hoveredTree = ref(null)
+const tooltipX    = ref(0)
+const tooltipY    = ref(0)
+const hoveredDist = computed(() => {
+  if (!hoveredTree.value || !store.userPosition) return null
+  const d = haversineDistance(store.userPosition, { lat: hoveredTree.value.lat, lon: hoveredTree.value.lon })
+  return d.toFixed(0)
+})
 
 const nearestInfo = computed(() => {
   if (!store.userPosition) return null
@@ -478,6 +503,35 @@ function onCanvasClick(e) {
   castRay()
 }
 
+let hoverThrottleId = null
+function onCanvasMouseMove(e) {
+  if (hoverThrottleId) return
+  hoverThrottleId = requestAnimationFrame(() => {
+    hoverThrottleId = null
+    const canvas = mapCanvas.value
+    if (!canvas) return
+    const rect = canvas.getBoundingClientRect()
+    pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1
+    pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1
+    raycaster.setFromCamera(pointer, camera)
+    const hits = raycaster.intersectObjects(crownMeshes, false)
+    if (hits.length) {
+      const treeId = hits[0].object.userData.treeId
+      const tree = store.trees.find(t => t.id === treeId) ?? null
+      hoveredTree.value = tree
+      // offset tooltip so it doesn't sit under the cursor
+      tooltipX.value = e.clientX - canvas.getBoundingClientRect().left + 14
+      tooltipY.value = e.clientY - canvas.getBoundingClientRect().top  - 10
+    } else {
+      hoveredTree.value = null
+    }
+  })
+}
+
+function onCanvasMouseLeave() {
+  hoveredTree.value = null
+}
+
 let lastTouchX = 0
 let lastTouchY = 0
 let touchStartTime = 0
@@ -720,4 +774,23 @@ function handleExport() {
 .hud-message.visible {
   opacity: 1;
 }
+
+.tree-tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: rgba(2, 9, 21, 0.92);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--cyan);
+  padding: 6px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 110px;
+  z-index: 30;
+}
+.tt-id   { font-size: 13px; font-weight: bold; color: var(--cyan); letter-spacing: 2px; }
+.tt-sp   { font-size: 10px; color: var(--dim); letter-spacing: 1px; text-transform: uppercase; }
+.tt-val  { font-size: 11px; color: var(--text); letter-spacing: 0.5px; }
+.tt-dist { font-size: 10px; color: var(--amber); letter-spacing: 0.5px; }
+.tt-done { font-size: 10px; color: var(--teal); letter-spacing: 0.5px; }
 </style>

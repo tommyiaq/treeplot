@@ -5,7 +5,19 @@
       <span class="gps-status hud-label">{{ gpsStatusText }}</span>
     </div>
     <div class="topbar-section topbar-center">
-      <span class="plot-name">{{ store.plotName.toUpperCase() }}</span>
+      <select
+        v-if="store.availablePlots.length"
+        class="plot-select"
+        :value="store.currentAdsId"
+        @change="onPlotChange"
+      >
+        <option
+          v-for="p in store.availablePlots"
+          :key="p.id"
+          :value="p.id"
+        >ADS {{ p.id }} ({{ p.count }})</option>
+      </select>
+      <span v-else class="plot-name">{{ store.plotName.toUpperCase() }}</span>
     </div>
     <div class="topbar-section topbar-right">
       <span class="progress-badge">
@@ -25,6 +37,10 @@ import { usePlotStore } from '../store/plot.js'
 const store = usePlotStore()
 
 const gpsActive = computed(() => store.userPosition !== null)
+
+function onPlotChange(e) {
+  store.changePlot(e.target.value)
+}
 
 const gpsStatusText = computed(() => {
   if (!store.userPosition) {
@@ -97,6 +113,23 @@ const gpsStatusText = computed(() => {
   overflow: hidden;
   white-space: nowrap;
 }
+
+.plot-select {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--cyan);
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: bold;
+  letter-spacing: 1px;
+  padding: 3px 6px;
+  border-radius: 2px;
+  cursor: pointer;
+  max-width: 160px;
+  outline: none;
+}
+.plot-select:focus { border-color: var(--cyan); }
+.plot-select option { background: #020915; color: var(--text); }
 
 .progress-badge {
   font-size: 13px;
