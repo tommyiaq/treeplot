@@ -102,14 +102,22 @@ export async function loadPlot(adsId = '1') {
         ? polarToLatLon(PLOT_CENTER.lat, PLOT_CENTER.lon, dist, azimuth)
         : { ...PLOT_CENTER }
 
+      const rc = (v) => { const n = parseFloat(v); return isFinite(n) && n > 0 ? n : null }
+      const hIns = parseFloat(r.H_INS)
+
       return {
         id:                  `T${String(r.ID).padStart(3, '0')}`,
         species:             mapSpecies(r.SPECIE),
-        specie_raw:          r.SPECIE,          // preserve original for display
+        specie_raw:          r.SPECIE,
         lat:                 pos.lat,
         lon:                 pos.lon,
         height_m:            isFinite(height) && height > 0 ? height : null,
         diameter_cm:         isFinite(diam)   && diam   > 0 ? diam   : null,
+        h_ins:               isFinite(hIns)   && hIns   > 0 ? hIns   : null,
+        rc_n:                rc(r.RC_N),
+        rc_e:                rc(r.RC_E),
+        rc_s:                rc(r.RC_S),
+        rc_o:                rc(r.RC_O),
         measured_at:         null,
         measured_height_m:   null,
         measured_diameter_cm:null,

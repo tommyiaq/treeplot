@@ -9,8 +9,6 @@ export default defineConfig({
     basicSsl(),
     VitePWA({
       registerType: 'autoUpdate',
-      // Don't let the SW intercept WebLLM's own cache writes (model weights go to
-      // IndexedDB / Cache Storage managed by WebLLM — SW shouldn't touch those).
       workbox: {
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
         maximumFileSizeToCacheInBytes: 10 * 1024 * 1024, // 10 MB limit for build assets
@@ -40,7 +38,8 @@ export default defineConfig({
       'Cross-Origin-Embedder-Policy': 'credentialless',
     },
   },
-  optimizeDeps: {
-    exclude: ['@mlc-ai/web-llm'],
+  define: {
+    // Silence "global is not defined" from any residual WebLLM references
+    global: 'globalThis',
   },
 })

@@ -207,10 +207,22 @@ function saveMeasurement() {
 
 // ── Gemini measurement prompt ─────────────────────────────────────────────────
 function buildMeasurementPrompt(tree) {
-  const rh = refH(tree)
-  const rd = refD(tree)
+  const hasPrev = tree.measured_at !== null
+  const prevBlock = hasPrev
+    ? `Ultima rilevazione di campo (${tree.measured_at.slice(0, 10)}): H=${tree.measured_height_m}m · DBH=${tree.measured_diameter_cm}cm · Salute=${tree.measured_health}/5`
+    : 'Nessuna rilevazione di campo precedente.'
+
+  const consistencyRules = hasPrev ? `
+── CONTROLLO CONSISTENZA ──
+• Altezza e DBH non dovrebbero diminuire rispetto all'ultima rilevazione (H=${tree.measured_height_m}m · DBH=${tree.measured_diameter_cm}cm).
+  Se diminuiscono, avvisa brevemente l'operatore e chiedi conferma prima di salvare.
+• La salute può variare in qualsiasi direzione.
+• Se l'operatore fornisce le stesse misure della rilevazione precedente, sono valide — salva normalmente.` : ''
+
   return `Sei un assistente per rilievi forestali sul campo.
-Albero corrente: ${tree.id} (${tree.species}). Valori di riferimento: H=${rh}m, DBH=${rd}cm.
+Albero: ${tree.id} (${tree.specie_raw || tree.species}).
+Rilievo originale (shapefile): H=${tree.height_m ?? '—'}m · DBH=${tree.diameter_cm ?? '—'}cm.
+${prevBlock}
 
 Il tuo compito è raccogliere tre misure dall'operatore: altezza (m), diametro/DBH (cm), stato di salute (1–5).
 
@@ -221,15 +233,26 @@ H=<n>m ✓ · DBH=<n>cm ✓ · Salute=<n>/5 ✓
 {"action":"save_measurement","height_m":<numero>,"diameter_cm":<numero>,"health":<intero 1-5>}
 \`\`\`
 
+── CASO "STESSE MISURE" / RELATIVE ──
+Se l'operatore usa espressioni relative, calcola il valore assoluto usando come base
+la rilevazione precedente (se esiste) o i valori di riferimento del rilievo originale.
+Esempi:
+• "1 metro in più di altezza, resto uguale" → H = base_H + 1, DBH e salute invariati
+• "cresciuto di 2m" → H = base_H + 2
+• "diametro aumentato di 3cm" → DBH = base_DBH + 3
+• "stesse misure" / "come prima" / "invariato" → usa tutti i valori base
+• "tutto uguale tranne la salute che è 2" → H e DBH invariati, health = 2
+La base è la rilevazione di campo precedente se esiste, altrimenti i valori del rilievo originale (H=${tree.height_m ?? '—'}m · DBH=${tree.diameter_cm ?? '—'}cm).
+Se manca la salute anche nella base, chiedila.
+
 ── CASO INCOMPLETO: manca uno o più valori ──
 Chiedi brevemente solo ciò che manca. Una frase, diretta.
 Es: "Manca il diametro — quanto è largo il tronco (cm)?"
 Es: "Che salute dai all'albero? (1 = morente, 5 = ottimo)"
 
-── VALIDAZIONE ──
+── VALIDAZIONE BASE ──
 Altezza: 0.1–100 m · DBH: 0.5–500 cm · Salute: intero 1–5.
-Se un valore sembra anomalo rispetto al riferimento, segnalalo e chiedi conferma prima di salvare.
-
+${consistencyRules}
 Lingua: italiano. Non aggiungere testo extra oltre a quanto indicato sopra.`
 }
 
@@ -315,18 +338,36 @@ function applyMeasurement(action) {
 async function sendMeasurementToLLM() {
   const lastUserText = store.chatMessages.filter(m => m.role === 'user').slice(-1)[0]?.content ?? ''
 
-  // Fast path: all 3 values already in the message — no need for LLM
-  const quick = parseValues(lastUserText)
-  if (quick.height !== null && quick.diameter !== null && quick.health !== null) {
-    handleMeasurementFallback(lastUserText)
+  // ── Step 1: always accumulate parsed state from this message ─────────────
+  // This runs regardless of LLM success/failure so state stays consistent.
+  const tree = measureTree.value
+  if (SAME_RE.test(lastUserText)) {
+    if (tree?.measured_at) {
+      // Previous field measurement → re-save immediately, no LLM needed
+      applyMeasurement({ action: 'save_measurement', height_m: tree.measured_height_m, diameter_cm: tree.measured_diameter_cm, health: tree.measured_health })
+      return
+    }
+    // Seed from shapefile reference if not already set
+    if (parsed.height   === null && tree?.height_m   != null) parsed.height   = tree.height_m
+    if (parsed.diameter === null && tree?.diameter_cm != null) parsed.diameter = tree.diameter_cm
+  } else {
+    const pv = parseValues(lastUserText)
+    if (pv.height   !== null) parsed.height   = pv.height
+    if (pv.diameter !== null) parsed.diameter = pv.diameter
+    if (pv.health   !== null) parsed.health   = pv.health
+  }
+
+  // ── Step 2: if all 3 accumulated, save immediately ───────────────────────
+  if (parsed.height !== null && parsed.diameter !== null && parsed.health !== null) {
+    applyMeasurement({ action: 'save_measurement', height_m: parsed.height, diameter_cm: parsed.diameter, health: parsed.health })
     return
   }
 
+  // ── Step 3: LLM handles the conversational part (ask for missing values) ─
   if (!isReady() || store.llmStatus === 'error') {
     handleMeasurementFallback(lastUserText)
     return
   }
-  // If greeting is still streaming, wait up to 8s for it to finish
   if (isStreaming.value) {
     for (let w = 0; w < 16; w++) {
       await new Promise(r => setTimeout(r, 500))
@@ -336,18 +377,15 @@ async function sendMeasurementToLLM() {
   }
 
   isStreaming.value = true
-  const tree = measureTree.value
   const systemMsg = { role: 'system', content: buildMeasurementPrompt(tree) }
   const historyForLLM = store.chatMessages
     .filter(m => m.role === 'user' || m.role === 'assistant')
     .slice(-10)
     .map(m => ({ role: m.role, content: m.content }))
 
-  const messages = [systemMsg, ...historyForLLM]
   let fullResponse = ''
-
   try {
-    const gen = chatWithTrees(messages)
+    const gen = chatWithTrees([systemMsg, ...historyForLLM])
     store.addChatMessage('assistant', '')
     const lastIdx = store.chatMessages.length - 1
 
@@ -357,34 +395,59 @@ async function sendMeasurementToLLM() {
       nextTick(scrollToBottom)
     }
 
+    // If LLM emitted JSON, use it (overrides accumulated values — LLM may have corrected them)
     const action = extractAction(fullResponse)
     if (action?.action === 'save_measurement') {
       store.chatMessages[lastIdx].content = stripJsonBlock(fullResponse)
       applyMeasurement(action)
-    } else {
-      // LLM didn't emit JSON — try regex on user's last message as silent fallback
-      const lastUserMsg = store.chatMessages.filter(m => m.role === 'user').slice(-1)[0]?.content ?? ''
-      const pv = parseValues(lastUserMsg)
-      if (pv.height !== null && pv.diameter !== null && pv.health !== null) {
-        store.chatMessages[lastIdx].content = stripJsonBlock(fullResponse)
-        applyMeasurement({ action: 'save_measurement', height_m: pv.height, diameter_cm: pv.diameter, health: pv.health })
-      }
     }
+    // Otherwise just show the LLM's question/warning — user will reply next turn
   } catch (err) {
     console.error('[LLM] Measurement stream error:', err)
-    if (!fullResponse) store.addChatMessage('assistant', 'Errore. Riprova o usa il form (⊞).')
+    if (!fullResponse) {
+      store.chatMessages.pop()
+      handleMeasurementFallback(lastUserText)
+    }
   } finally {
     isStreaming.value = false
     nextTick(scrollToBottom)
   }
 }
 
-// Regex fallback (used when LLM isn't ready yet)
+const SAME_RE = /\b(stess[eo]|ugual[ei]|come prima|di prima|invariat[eo]|identic[aho]|same|unchanged|conferm[ao])\b/i
+
+// Regex fallback (used when LLM isn't ready or fails)
 function handleMeasurementFallback(text) {
+  // "Same as before" — re-apply last field measurement, or fall back to shapefile reference
+  if (SAME_RE.test(text)) {
+    const tree = measureTree.value
+    if (tree?.measured_at) {
+      // Has previous field measurement — re-save same values
+      applyMeasurement({ action: 'save_measurement', height_m: tree.measured_height_m, diameter_cm: tree.measured_diameter_cm, health: tree.measured_health })
+    } else if (tree?.height_m != null && tree?.diameter_cm != null) {
+      // No field measurement yet — seed from shapefile reference, ask for health
+      parsed.height   = tree.height_m
+      parsed.diameter = tree.diameter_cm
+      store.addChatMessage('assistant',
+        `Uso i valori di riferimento: H=${tree.height_m}m · DBH=${tree.diameter_cm}cm.\nChe salute dai all'albero? (1 = morente, 5 = ottimo)`)
+    } else {
+      store.addChatMessage('assistant', 'Nessuna rilevazione precedente. Dimmi le misure.')
+    }
+    return
+  }
+
+  // "sì/si/yes/ok" when only health is still missing → treat as confirmation to proceed
+  const CONFIRM_RE = /^\s*(s[iì]|yes|ok|okay|va bene|certo|esatto|confermo)\s*$/i
+  if (CONFIRM_RE.test(text) && parsed.height !== null && parsed.diameter !== null && parsed.health === null) {
+    store.addChatMessage('assistant', 'Dimmi la salute dell\'albero (1 = morente, 5 = ottimo).')
+    return
+  }
+
+  // Merge new values into existing state — don't overwrite already-seeded values
   const pv = parseValues(text)
-  parsed.height   = pv.height
-  parsed.diameter = pv.diameter
-  parsed.health   = pv.health
+  if (pv.height   !== null) parsed.height   = pv.height
+  if (pv.diameter !== null) parsed.diameter = pv.diameter
+  if (pv.health   !== null) parsed.health   = pv.health
 
   const missing = []
   if (parsed.height   === null) missing.push('altezza (m)')

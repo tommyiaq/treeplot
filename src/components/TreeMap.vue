@@ -130,6 +130,61 @@ function showHudMessage(msg, duration = 2500) {
 }
 
 // ──────────────────────────────────────────────
+// Asymmetric crown geometry
+// North = -Z in scene (from latLonToXZ: z = -R * dlat)
+// ──────────────────────────────────────────────
+function interpolateCrownR(theta, rcN, rcE, rcS, rcO) {
+  const half = Math.PI / 2
+  const ease = (t) => 0.5 - 0.5 * Math.cos(t * Math.PI) // smooth step
+  if (theta <= half)              return rcN + (rcE - rcN) * ease(theta / half)
+  if (theta <= Math.PI)           return rcE + (rcS - rcE) * ease((theta - half) / half)
+  if (theta <= 3 * half)          return rcS + (rcO - rcS) * ease((theta - Math.PI) / half)
+  return rcO + (rcN - rcO) * ease((theta - 3 * half) / half)
+}
+
+function makeAsymmetricCrown(rcN, rcE, rcS, rcO, crownH, isConifer) {
+  const RINGS = 10, SEGS = 16
+  const pos = [], idx = []
+
+  for (let r = 0; r <= RINGS; r++) {
+    const t = r / RINGS
+    const y = crownH * (1 - t)
+    const profile = isConifer ? t : Math.sin(t * Math.PI)
+
+    for (let s = 0; s <= SEGS; s++) {
+      const theta = (s / SEGS) * 2 * Math.PI
+      const rr = interpolateCrownR(theta, rcN, rcE, rcS, rcO) * profile
+      pos.push(rr * Math.sin(theta), y, -rr * Math.cos(theta))
+    }
+  }
+
+  for (let r = 0; r < RINGS; r++) {
+    for (let s = 0; s < SEGS; s++) {
+      const a = r * (SEGS + 1) + s,  b = a + 1
+      const c = a + (SEGS + 1),      d = c + 1
+      idx.push(a, c, b,  b, c, d)
+    }
+  }
+
+  // Base cap for conifers — filled disc showing the irregular footprint
+  if (isConifer) {
+    const centerIdx = pos.length / 3
+    pos.push(0, 0, 0)                        // centre of base at y=0
+    const baseStart = RINGS * (SEGS + 1)
+    for (let s = 0; s < SEGS; s++) {
+      // Wind so normal faces downward (-Y)
+      idx.push(centerIdx, baseStart + s, baseStart + s + 1)
+    }
+  }
+
+  const geo = new THREE.BufferGeometry()
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3))
+  geo.setIndex(idx)
+  geo.computeVertexNormals()
+  return geo
+}
+
+// ──────────────────────────────────────────────
 // Species color configs
 // ──────────────────────────────────────────────
 const SPECIES_CONFIG = {
@@ -165,16 +220,16 @@ function initThree() {
   scene = new THREE.Scene()
 
   // Camera
-  camera = new THREE.PerspectiveCamera(55, w / h, 0.1, 500)
-  camera.position.set(0, 25, 18)
+  camera = new THREE.PerspectiveCamera(55, w / h, 0.1, 800)
+  camera.position.set(0, 40, 32)
   camera.lookAt(0, 0, 0)
 
   // Controls
   controls = new OrbitControls(camera, canvas)
   controls.enableDamping = true
   controls.dampingFactor = 0.08
-  controls.minDistance = 5
-  controls.maxDistance = 60
+  controls.minDistance = 8
+  controls.maxDistance = 120
   controls.maxPolarAngle = Math.PI / 2.05
   controls.touches = {
     ONE: THREE.TOUCH.ROTATE,
@@ -306,44 +361,39 @@ function makeTreeGroup(tree) {
   const group = new THREE.Group()
   group.userData.treeId = tree.id
 
-  const diamCm = tree.diameter_cm
-  // Compress visual height so trees fit the camera framing (plot radius = 13 units)
-  const height = tree.height_m * 0.18
+  const diamCm = tree.diameter_cm ?? 20
+  const height = tree.height_m   ?? 10   // 1 unit = 1 metre
+  const isConifer = tree.species !== 'quercia'
 
-  // Trunk
-  const trunkH = Math.max(0.3, height * 0.25)
-  const trunkGeom = new THREE.CylinderGeometry(
-    (diamCm / 200),
-    (diamCm / 200) * 0.8,
-    trunkH,
-    8
-  )
-  const trunkMat = new THREE.MeshBasicMaterial({ color: 0x3d2010 })
-  const trunk = new THREE.Mesh(trunkGeom, trunkMat)
+  // Trunk goes from ground to crown insertion height (H_INS)
+  const trunkH = tree.h_ins ?? (isConifer ? height * 0.30 : height * 0.55)
+  const trunkR = Math.max(0.05, diamCm / 200)
+  const trunkGeom = new THREE.CylinderGeometry(trunkR * 0.8, trunkR, trunkH, 8)
+  const trunkMat  = new THREE.MeshBasicMaterial({ color: 0x3d2010 })
+  const trunk     = new THREE.Mesh(trunkGeom, trunkMat)
   trunk.position.y = trunkH / 2
   group.add(trunk)
 
-  // Crown
-  let crownGeom
-  let crownYOffset
-  const cfg = SPECIES_CONFIG[tree.species] || SPECIES_CONFIG.pino
+  // Crown — asymmetric, driven by RC_N/E/S/O when available
+  const crownH = Math.max(0.5, height - trunkH)
+  const hasRC  = tree.rc_n > 0 && tree.rc_e > 0 && tree.rc_s > 0 && tree.rc_o > 0
+  const fallbackR = isConifer ? height * 0.18 : height * 0.22
+  const rcN = hasRC ? tree.rc_n : fallbackR
+  const rcE = hasRC ? tree.rc_e : fallbackR
+  const rcS = hasRC ? tree.rc_s : fallbackR
+  const rcO = hasRC ? tree.rc_o : fallbackR
 
-  if (tree.species === 'pino') {
-    crownGeom = new THREE.ConeGeometry((diamCm / 100) * 0.8, height * 0.7, 8)
-    crownYOffset = trunkH + (height * 0.7) / 2
-  } else if (tree.species === 'quercia') {
-    crownGeom = new THREE.SphereGeometry((diamCm / 100) * 1.1, 8, 6)
-    crownYOffset = trunkH + (diamCm / 100) * 1.1
-  } else {
-    // cipresso
-    crownGeom = new THREE.ConeGeometry((diamCm / 100) * 0.3, height * 0.9, 6)
-    crownYOffset = trunkH + (height * 0.9) / 2
-  }
+  const cfg = SPECIES_CONFIG[tree.species] || SPECIES_CONFIG.pino
+  const crownGeom  = makeAsymmetricCrown(rcN, rcE, rcS, rcO, crownH, isConifer)
+  const crownYOffset = trunkH    // crown local y=0 sits at trunk top
 
   const crownMat = new THREE.MeshStandardMaterial({
     color: cfg.crownColor,
     emissive: cfg.crownEmissive,
     emissiveIntensity: cfg.emissiveIntensity,
+    transparent: true,
+    opacity: 1.0,
+    side: THREE.DoubleSide,
     roughness: 0.8,
     metalness: 0.0,
   })
@@ -387,29 +437,35 @@ function buildTreeObjects() {
 function updateTreeStates() {
   const tappableIds = new Set(store.tappableTrees.map((t) => t.id))
 
-  treeGroups.forEach(({ crownMesh, treeId }) => {
+  treeGroups.forEach(({ crownMesh, trunkMesh, treeId }) => {
     const tree = store.trees.find((t) => t.id === treeId)
     if (!tree) return
 
     const mat = crownMesh.material
     const cfg = SPECIES_CONFIG[tree.species] || SPECIES_CONFIG.pino
+    const outOfRange = store.userPosition && !tappableIds.has(treeId) && tree.measured_at === null
 
-    if (tree.measured_at !== null) {
-      // Measured: species color, pulse handled in render loop
+    if (outOfRange) {
+      mat.color.set(GRAY_COLOR)
+      mat.emissive.set(GRAY_EMISSIVE)
+      mat.emissiveIntensity = 0.1
+      mat.opacity = 0.18
+    } else if (tree.measured_at !== null) {
       mat.color.set(cfg.crownColor)
       mat.emissive.set(cfg.crownEmissive)
       mat.emissiveIntensity = 0.5
-    } else if (tappableIds.has(treeId)) {
-      // Tappable (nearby unmeasured): dim gray with faster pulse
+      mat.opacity = 1.0
+    } else {
+      // Tappable unmeasured
       mat.color.set(GRAY_COLOR)
       mat.emissive.set(GRAY_EMISSIVE)
       mat.emissiveIntensity = TAPPABLE_EMISSIVE_INTENSITY
-    } else {
-      // Unmeasured, not tappable: flat gray
-      mat.color.set(GRAY_COLOR)
-      mat.emissive.set(GRAY_EMISSIVE)
-      mat.emissiveIntensity = 0.2
+      mat.opacity = 1.0
     }
+
+    // Fade trunk together with crown
+    trunkMesh.material.transparent = true
+    trunkMesh.material.opacity = outOfRange ? 0.12 : 1.0
   })
 }
 
