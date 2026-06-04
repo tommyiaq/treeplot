@@ -300,6 +300,21 @@ function applyMeasurement(action) {
     return
   }
 
+  // Regression check — trees don't shrink
+  const prev = measureTree.value
+  const prevH = prev?.measured_height_m   ?? prev?.height_m   ?? null
+  const prevD = prev?.measured_diameter_cm ?? prev?.diameter_cm ?? null
+  if (prevH !== null && h < prevH) {
+    store.addChatMessage('assistant', `⚠ Altezza ${h}m inferiore al valore precedente (${prevH}m). Correggi l'altezza e riprova.`)
+    parsed.height = null  // only clear height, keep diameter/health for LLM context
+    return
+  }
+  if (prevD !== null && d < prevD) {
+    store.addChatMessage('assistant', `⚠ DBH ${d}cm inferiore al valore precedente (${prevD}cm). Correggi il diametro e riprova.`)
+    parsed.diameter = null  // only clear diameter
+    return
+  }
+
   // Update preview
   parsed.height   = h
   parsed.diameter = d
@@ -422,6 +437,18 @@ function handleMeasurementFallback(text) {
   if (parsed.height   === null) missing.push('altezza (m)')
   if (parsed.diameter === null) missing.push('DBH (cm)')
   if (parsed.health   === null) missing.push('salute (1–5)')
+
+  // If exactly one value is still missing and the user gave a bare number, use it
+  if (missing.length === 1) {
+    const bare = text.match(/\b(\d+(?:\.\d+)?)\b/)
+    if (bare) {
+      const n = parseFloat(bare[1])
+      if (missing[0].startsWith('altezza'))  parsed.height   = n
+      if (missing[0].startsWith('DBH'))      parsed.diameter = n
+      if (missing[0].startsWith('salute'))   parsed.health   = Math.round(n)
+      missing.length = 0
+    }
+  }
 
   if (missing.length === 3) {
     store.addChatMessage('assistant',
