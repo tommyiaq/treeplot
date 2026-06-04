@@ -78,5 +78,53 @@ export async function* chatWithTrees(messages) {
   console.log('[Gemini] stream done,', chunks, 'chunks')
 }
 
+/**
+ * Measurement parsing — always returns structured JSON:
+ * { height_m, diameter_cm, health, message }
+ */
+export async function parseMeasurementJSON(messages) {
+  const systemMsg = messages.find(m => m.role === 'system')
+  const history   = messages.filter(m => m.role !== 'system' && m.content?.trim())
+
+  const contents = []
+  for (const m of history) {
+    const role = m.role === 'assistant' ? 'model' : 'user'
+    if (contents.length && contents.at(-1).role === role) {
+      contents.at(-1).parts[0].text += '\n' + m.content
+    } else {
+      contents.push({ role, parts: [{ text: m.content }] })
+    }
+  }
+  while (contents.length && contents[0].role !== 'user') contents.shift()
+  if (!contents.length) return null
+
+  const body = {
+    contents,
+    ...(systemMsg && { systemInstruction: { parts: [{ text: systemMsg.content }] } }),
+    generationConfig: {
+      temperature: 0.2,
+      maxOutputTokens: 200,
+      responseMimeType: 'application/json',
+    },
+  }
+
+  const res = await fetch(`${ENDPOINT}:generateContent`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': API_KEY },
+    body: JSON.stringify(body),
+  })
+
+  if (!res.ok) {
+    const err = await res.text().catch(() => '')
+    console.error('[Gemini] parseMeasurementJSON error', res.status, err.slice(0, 200))
+    throw new Error(`Gemini ${res.status}`)
+  }
+
+  const data = await res.json()
+  const text = data.candidates?.[0]?.content?.parts?.[0]?.text
+  if (!text) return null
+  return JSON.parse(text)
+}
+
 export async function clearModelCache() { /* no-op */ }
 export async function disposeLLM()      { /* no-op */ }

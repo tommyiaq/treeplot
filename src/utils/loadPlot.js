@@ -1,7 +1,7 @@
 // Lightweight inline DBF parser + forestry plot loader.
 // No external dependencies — reads binary dBASE III format directly.
 
-const PLOT_CENTER = { lat: 43.46878, lon: 11.15117 }
+const PLOT_CENTER = { lat: 43.46849, lon: 11.15101 }
 
 // ── Species normaliser ──────────────────────────────────────────────────────
 const CONIFER_RE  = /pino|pinus|picea|abete|larix|larice|douglasia|pseudotsuga|cedro|cedrus|abies/i

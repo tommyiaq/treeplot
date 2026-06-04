@@ -73,7 +73,7 @@ export const usePlotStore = defineStore('plot', {
       try {
         const trees = await loadPlot(this.currentAdsId)
         const name = `ADS_${this.currentAdsId}`
-        this.loadTrees(trees, { lat: 43.46878, lon: 11.15117, name }, name)
+        this.loadTrees(trees, { lat: 43.46849, lon: 11.15101, name }, name)
       } finally {
         this.gpsWaiting = false
       }

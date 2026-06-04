@@ -106,7 +106,7 @@
 <script setup>
 import { ref, computed, watch, nextTick, onMounted, reactive } from 'vue'
 import { usePlotStore } from '../store/plot.js'
-import { initLLM, chatWithTrees, isReady, clearModelCache } from '../utils/gemini.js'
+import { initLLM, chatWithTrees, parseMeasurementJSON, isReady, clearModelCache } from '../utils/gemini.js'
 import { haversineDistance, compassBearing, cardinalDirection } from '../utils/gps.js'
 
 const store = usePlotStore()
@@ -207,88 +207,70 @@ function saveMeasurement() {
 
 // ── Gemini measurement prompt ─────────────────────────────────────────────────
 function buildMeasurementPrompt(tree) {
-  const hasPrev = tree.measured_at !== null
-  const prevBlock = hasPrev
-    ? `Ultima rilevazione di campo (${tree.measured_at.slice(0, 10)}): H=${tree.measured_height_m}m · DBH=${tree.measured_diameter_cm}cm · Salute=${tree.measured_health}/5`
-    : 'Nessuna rilevazione di campo precedente.'
+  const base = tree.measured_at
+    ? `Ultima rilevazione: H=${tree.measured_height_m}m · DBH=${tree.measured_diameter_cm}cm · Salute=${tree.measured_health}/5`
+    : `Rilievo originale: H=${tree.height_m ?? '—'}m · DBH=${tree.diameter_cm ?? '—'}cm`
 
-  const consistencyRules = hasPrev ? `
-── CONTROLLO CONSISTENZA ──
-• Altezza e DBH non dovrebbero diminuire rispetto all'ultima rilevazione (H=${tree.measured_height_m}m · DBH=${tree.measured_diameter_cm}cm).
-  Se diminuiscono, avvisa brevemente l'operatore e chiedi conferma prima di salvare.
-• La salute può variare in qualsiasi direzione.
-• Se l'operatore fornisce le stesse misure della rilevazione precedente, sono valide — salva normalmente.` : ''
+  return `Assistente rilievi forestali. Albero: ${tree.id} (${tree.specie_raw || tree.species}). ${base}.
 
-  return `Sei un assistente per rilievi forestali sul campo.
-Albero: ${tree.id} (${tree.specie_raw || tree.species}).
-Rilievo originale (shapefile): H=${tree.height_m ?? '—'}m · DBH=${tree.diameter_cm ?? '—'}cm.
-${prevBlock}
+Estrai dal messaggio dell'operatore: altezza (m), diametro/DBH (cm), salute (1–5).
+Gestisci espressioni naturali: "stesse misure", "1m in più", "cresciuto di 3cm", "salute ottima" (=5), ecc.
+Usa i valori base per risolvere espressioni relative o "stesse misure".
+Se altezza o DBH diminuiscono rispetto alla base, avvisa nel message.
 
-Il tuo compito è raccogliere tre misure dall'operatore: altezza (m), diametro/DBH (cm), stato di salute (1–5).
+Rispondi SEMPRE e SOLO con questo JSON (nessun testo fuori dal JSON):
+{"height_m": <numero o null>, "diameter_cm": <numero o null>, "health": <intero 1-5 o null>, "message": "<testo breve in italiano>"}
 
-── CASO COMPLETO: tutti e tre i valori presenti ──
-Rispondi SOLO con la riga di riepilogo seguita dal blocco JSON, nient'altro:
-H=<n>m ✓ · DBH=<n>cm ✓ · Salute=<n>/5 ✓
-\`\`\`json
-{"action":"save_measurement","height_m":<numero>,"diameter_cm":<numero>,"health":<intero 1-5>}
-\`\`\`
-
-── CASO "STESSE MISURE" / RELATIVE ──
-Se l'operatore usa espressioni relative, calcola il valore assoluto usando come base
-la rilevazione precedente (se esiste) o i valori di riferimento del rilievo originale.
-Esempi:
-• "1 metro in più di altezza, resto uguale" → H = base_H + 1, DBH e salute invariati
-• "cresciuto di 2m" → H = base_H + 2
-• "diametro aumentato di 3cm" → DBH = base_DBH + 3
-• "stesse misure" / "come prima" / "invariato" → usa tutti i valori base
-• "tutto uguale tranne la salute che è 2" → H e DBH invariati, health = 2
-La base è la rilevazione di campo precedente se esiste, altrimenti i valori del rilievo originale (H=${tree.height_m ?? '—'}m · DBH=${tree.diameter_cm ?? '—'}cm).
-Se manca la salute anche nella base, chiedila.
-
-── CASO INCOMPLETO: manca uno o più valori ──
-Chiedi brevemente solo ciò che manca. Una frase, diretta.
-Es: "Manca il diametro — quanto è largo il tronco (cm)?"
-Es: "Che salute dai all'albero? (1 = morente, 5 = ottimo)"
-
-── VALIDAZIONE BASE ──
-Altezza: 0.1–100 m · DBH: 0.5–500 cm · Salute: intero 1–5.
-${consistencyRules}
-Lingua: italiano. Non aggiungere testo extra oltre a quanto indicato sopra.`
+- Valori trovati → numero; valori mancanti → null
+- message: conferma se completo, oppure chiede solo i valori mancanti`
 }
 
-function extractAction(text) {
-  const match = text.match(/```json\s*(\{[\s\S]*?\})\s*```/)
-  if (!match) return null
-  try { return JSON.parse(match[1]) } catch { return null }
-}
 
-// Pure regex parser — returns {height, diameter, health}, each null if not found
-function parseValues(raw) {
+// Pure regex parser — returns {height, diameter, health}, each null if not found.
+// refH / refD: reference values used to resolve relative expressions ("X in più").
+function parseValues(raw, refH = null, refD = null) {
   let t = raw.toLowerCase().replace(/,/g, '.').replace(/\s+/g, ' ')
   const result = { height: null, diameter: null, health: null }
 
-  const hCtx = /(?:altezza|alt(?:ezza)?|h(?:eight)?)\s*[:=]?\s*(\d+(?:\.\d+)?)/
-  const hUnit = /(\d+(?:\.\d+)?)\s*m(?:etri?)?(?!\w)(?!\s*c)/
+  // ── Height ────────────────────────────────────────────────────────────────
+  const hCtx  = /(?:altezza|alt(?:ezza)?|h(?:eight)?)\s*[:=]?\s*(\d+(?:\.\d+)?)/
+  const hUnit = /(\d+(?:\.\d+)?)\s*m(?:etr[io]?)?(?!\w)(?!\s*c)/   // metro/metri/m
   let m = t.match(hCtx) || t.match(hUnit)
   if (m) { result.height = parseFloat(m[1]); t = t.replace(m[0], ' ') }
 
-  const dCtx = /(?:diametro|diam(?:etro)?|dbh)\s*[:=]?\s*(\d+(?:\.\d+)?)/
+  // Relative height: "X m in più", "aumentata di X", "X metro in più"
+  if (result.height === null && refH !== null) {
+    const rel = t.match(/(\d+(?:\.\d+)?)\s*m(?:etr[io]?)?\s+in\s+più/i)
+             || t.match(/(?:aumentat[ao]|cresciut[ao]|salito)\s+di\s+(\d+(?:\.\d+)?)/i)
+             || t.match(/in\s+più\s+(?:di\s+)?(\d+(?:\.\d+)?)\s*m/i)
+    if (rel) result.height = Math.round((refH + parseFloat(rel[1])) * 10) / 10
+  }
+
+  // ── Diameter ──────────────────────────────────────────────────────────────
+  const dCtx  = /(?:diametro|diam(?:etro)?|dbh)\s*[:=]?\s*(\d+(?:\.\d+)?)/
   const dUnit = /(\d+(?:\.\d+)?)\s*c(?:enti)?m(?:etri?)?(?!\w)/
   m = t.match(dCtx) || t.match(dUnit)
   if (m) { result.diameter = parseFloat(m[1]); t = t.replace(m[0], ' ') }
 
-  // numeric health
+  // Relative diameter: "X cm in più", "diametro cresciuto di X"
+  if (result.diameter === null && refD !== null) {
+    const rel = t.match(/(\d+(?:\.\d+)?)\s*cm\s+in\s+più/i)
+             || t.match(/(?:diametro\s+)?(?:aumentat[ao]|cresciut[ao])\s+di\s+(\d+(?:\.\d+)?)\s*cm/i)
+             || t.match(/(?:diametro\s+)?in\s+più\s+(?:di\s+)?(\d+(?:\.\d+)?)\s*cm/i)
+    if (rel) result.diameter = Math.round((refD + parseFloat(rel[1])) * 10) / 10
+  }
+
+  // ── Health ────────────────────────────────────────────────────────────────
   const healthCtx = /(?:salute|stato|health)\s*[:=]?\s*([1-5])/
   m = t.match(healthCtx) || t.match(/\b([1-5])\b/)
   if (m) {
     result.health = parseInt(m[1])
   } else {
-    // Italian adjective health mapping
     const healthWords = [
       [5, /\b(ottim[ao]|ottimale|eccellente|perfett[ao])\b/],
       [4, /\b(buon[ao]|bene|discret[ao]|sano|sana)\b/],
       [3, /\b(medi[ao]|nella norma|accettabile|suffi\w+)\b/],
-      [2, /\b(scarso|scarsa|cattiv[ao]|bas\w+|debole|malatо|malata)\b/],
+      [2, /\b(scarso|scarsa|cattiv[ao]|bas\w+|debole|malat[ao])\b/],
       [1, /\b(pessim[ao]|morente|mort[ao]|critic[ao]|gravissim[ao])\b/],
     ]
     for (const [val, re] of healthWords) {
@@ -299,9 +281,6 @@ function parseValues(raw) {
   return result
 }
 
-function stripJsonBlock(text) {
-  return text.replace(/\n?```json[\s\S]*?```\n?/g, '').trim()
-}
 
 function applyMeasurement(action) {
   const h = Number(action.height_m)
@@ -351,7 +330,9 @@ async function sendMeasurementToLLM() {
     if (parsed.height   === null && tree?.height_m   != null) parsed.height   = tree.height_m
     if (parsed.diameter === null && tree?.diameter_cm != null) parsed.diameter = tree.diameter_cm
   } else {
-    const pv = parseValues(lastUserText)
+    const refH = tree?.measured_height_m   ?? tree?.height_m   ?? null
+    const refD = tree?.measured_diameter_cm ?? tree?.diameter_cm ?? null
+    const pv = parseValues(lastUserText, refH, refD)
     if (pv.height   !== null) parsed.height   = pv.height
     if (pv.diameter !== null) parsed.diameter = pv.diameter
     if (pv.health   !== null) parsed.health   = pv.health
@@ -363,55 +344,40 @@ async function sendMeasurementToLLM() {
     return
   }
 
-  // ── Step 3: LLM handles the conversational part (ask for missing values) ─
+  // ── Step 3: LLM returns structured JSON {height_m, diameter_cm, health, message} ─
   if (!isReady() || store.llmStatus === 'error') {
     handleMeasurementFallback(lastUserText)
     return
   }
-  if (isStreaming.value) {
-    for (let w = 0; w < 16; w++) {
-      await new Promise(r => setTimeout(r, 500))
-      if (!isStreaming.value) break
-    }
-    if (isStreaming.value) { handleMeasurementFallback(lastUserText); return }
-  }
 
-  isStreaming.value = true
   const systemMsg = { role: 'system', content: buildMeasurementPrompt(tree) }
   const historyForLLM = store.chatMessages
     .filter(m => m.role === 'user' || m.role === 'assistant')
     .slice(-10)
     .map(m => ({ role: m.role, content: m.content }))
 
-  let fullResponse = ''
   try {
-    const gen = chatWithTrees([systemMsg, ...historyForLLM])
-    store.addChatMessage('assistant', '')
-    const lastIdx = store.chatMessages.length - 1
+    const result = await parseMeasurementJSON([systemMsg, ...historyForLLM])
+    if (!result) throw new Error('empty')
 
-    for await (const chunk of gen) {
-      fullResponse += chunk
-      store.chatMessages[lastIdx].content = stripJsonBlock(fullResponse)
-      nextTick(scrollToBottom)
-    }
-
-    // If LLM emitted JSON, use it (overrides accumulated values — LLM may have corrected them)
-    const action = extractAction(fullResponse)
-    if (action?.action === 'save_measurement') {
-      store.chatMessages[lastIdx].content = stripJsonBlock(fullResponse)
-      applyMeasurement(action)
-    }
-    // Otherwise just show the LLM's question/warning — user will reply next turn
-  } catch (err) {
-    console.error('[LLM] Measurement stream error:', err)
-    if (!fullResponse) {
-      store.chatMessages.pop()
-      handleMeasurementFallback(lastUserText)
-    }
-  } finally {
-    isStreaming.value = false
+    // Show the LLM's message
+    store.addChatMessage('assistant', result.message ?? '')
     nextTick(scrollToBottom)
+
+    // Merge values
+    if (result.height_m    != null) parsed.height   = result.height_m
+    if (result.diameter_cm != null) parsed.diameter = result.diameter_cm
+    if (result.health      != null) parsed.health   = result.health
+
+    // Save if all 3 now accumulated
+    if (parsed.height !== null && parsed.diameter !== null && parsed.health !== null) {
+      applyMeasurement({ action: 'save_measurement', height_m: parsed.height, diameter_cm: parsed.diameter, health: parsed.health })
+    }
+  } catch (err) {
+    console.error('[LLM] parseMeasurementJSON error:', err)
+    handleMeasurementFallback(lastUserText)
   }
+  nextTick(scrollToBottom)
 }
 
 const SAME_RE = /\b(stess[eo]|ugual[ei]|come prima|di prima|invariat[eo]|identic[aho]|same|unchanged|conferm[ao])\b/i
@@ -444,7 +410,10 @@ function handleMeasurementFallback(text) {
   }
 
   // Merge new values into existing state — don't overwrite already-seeded values
-  const pv = parseValues(text)
+  const _tree = measureTree.value
+  const _refH = _tree?.measured_height_m   ?? _tree?.height_m   ?? null
+  const _refD = _tree?.measured_diameter_cm ?? _tree?.diameter_cm ?? null
+  const pv = parseValues(text, _refH, _refD)
   if (pv.height   !== null) parsed.height   = pv.height
   if (pv.diameter !== null) parsed.diameter = pv.diameter
   if (pv.health   !== null) parsed.health   = pv.health

@@ -34,7 +34,7 @@ const csvInputRef = ref(null)
 // ──────────────────────────────────────────────
 // Startup: restore from localStorage or wait for GPS
 // ──────────────────────────────────────────────
-const PLOT_CENTER = { lat: 43.46878, lon: 11.15117 }
+const PLOT_CENTER = { lat: 43.46849, lon: 11.15101 }
 
 onMounted(async () => {
   // Load plot list (needed for dropdown regardless of saved state)
